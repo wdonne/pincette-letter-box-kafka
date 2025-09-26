@@ -13,13 +13,16 @@ import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.logging.Level.SEVERE;
 import static java.util.logging.Logger.getLogger;
+import static net.pincette.config.Util.configValue;
 import static net.pincette.jes.JsonFields.CORR;
 import static net.pincette.jes.JsonFields.ID;
 import static net.pincette.jes.Util.getUsername;
 import static net.pincette.jes.tel.OtelUtil.attributes;
 import static net.pincette.jes.tel.OtelUtil.metrics;
+import static net.pincette.jes.tel.OtelUtil.retainTraceSample;
 import static net.pincette.jes.util.Kafka.createReliableProducer;
 import static net.pincette.json.JsonUtil.createObjectBuilder;
+import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.netty.http.Util.simpleResponse;
 import static net.pincette.netty.http.Util.wrapMetrics;
@@ -28,6 +31,7 @@ import static net.pincette.rs.Chain.with;
 import static net.pincette.rs.FlattenList.flattenList;
 import static net.pincette.rs.LambdaSubscriber.lambdaSubscriber;
 import static net.pincette.rs.Probe.probeValue;
+import static net.pincette.rs.QueuePublisher.queuePublisher;
 import static net.pincette.rs.Util.empty;
 import static net.pincette.rs.json.Util.parseJson;
 import static net.pincette.rs.kafka.KafkaSubscriber.subscriber;
@@ -43,18 +47,17 @@ import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.opentelemetry.api.metrics.Meter;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow;
 import java.util.concurrent.Flow.Subscriber;
-import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -70,22 +73,27 @@ import net.pincette.json.JsonUtil;
 import net.pincette.kafka.json.JsonSerializer;
 import net.pincette.netty.http.Metrics;
 import net.pincette.netty.http.RequestHandler;
-import net.pincette.rs.DequePublisher;
+import net.pincette.rs.QueuePublisher;
 import net.pincette.rs.Source;
 import net.pincette.util.Util.PredicateException;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
 
+/**
+ * @author Werner Donné
+ */
 public class Publisher implements AutoCloseable {
   private static final String ANONYMOUS = "anonymous";
   private static final String AS_STRING = "asString";
+  private static final int DEFAULT_TRACE_SAMPLE_PERCENTAGE = 10;
   private static final String HTTP_SERVER_LETTER_BOX_MESSAGES = "http.server.letter_box_messages";
   private static final String INSTANCE_ATTRIBUTE = "instance";
   private static final String KAFKA = "kafka";
   private static final Logger LOGGER = getLogger("net.pincette.letterbox.kafka");
   private static final String MESSAGE_TOPIC = "topic";
   private static final String NAMESPACE = "namespace";
+  private static final String TRACE_SAMPLE_PERCENTAGE = "traceSamplePercentage";
   private static final String TRACES_TOPIC = "tracesTopic";
   private static final String TRACE_ID_FIELD = "traceId";
 
@@ -101,6 +109,7 @@ public class Publisher implements AutoCloseable {
   private final String topic;
   private final String tracesTopic;
   private final Function<Context, Map<String, String>> telemetryAttributes;
+  private final int tracePercentage;
   private final Function<Context, List<JsonObject>> transform;
   private final Predicate<Context> verify;
 
@@ -113,18 +122,30 @@ public class Publisher implements AutoCloseable {
       final Function<Context, Map<String, String>> telemetryAttributes,
       final Config config) {
     this.config = config;
-    this.asString = configValue(Config::getBoolean, AS_STRING).orElse(false);
+    this.asString =
+        ofNullable(config).flatMap(c -> configValue(c::getBoolean, AS_STRING)).orElse(false);
     this.instance = instance != null ? instance : randomUUID().toString();
-    this.kafkaConfig = configValue(Config::getConfig, KAFKA).map(Kafka::fromConfig).orElse(null);
-    this.serviceNamespace = configValue(Config::getString, NAMESPACE).orElse(null);
+    this.kafkaConfig =
+        ofNullable(config)
+            .flatMap(c -> configValue(c::getConfig, KAFKA))
+            .map(Kafka::fromConfig)
+            .orElse(null);
+    this.serviceNamespace =
+        ofNullable(config).flatMap(c -> configValue(c::getString, NAMESPACE)).orElse(null);
     this.serviceName = serviceName;
     this.serviceVersion = serviceVersion;
     this.verify = verify;
     this.transform = transform != null ? transform : Publisher::noTransformation;
-    this.topic = configValue(Config::getString, MESSAGE_TOPIC).orElse(null);
-    this.tracesTopic = configValue(Config::getString, TRACES_TOPIC).orElse(null);
+    this.topic =
+        ofNullable(config).flatMap(c -> configValue(c::getString, MESSAGE_TOPIC)).orElse(null);
+    this.tracesTopic =
+        ofNullable(config).flatMap(c -> configValue(c::getString, TRACES_TOPIC)).orElse(null);
     this.telemetryAttributes =
         telemetryAttributes != null ? telemetryAttributes : pair -> new HashMap<>();
+    tracePercentage =
+        ofNullable(config)
+            .flatMap(c -> configValue(c::getInt, TRACE_SAMPLE_PERCENTAGE))
+            .orElse(DEFAULT_TRACE_SAMPLE_PERCENTAGE);
 
     eventTrace =
         tracesTopic != null
@@ -196,7 +217,7 @@ public class Publisher implements AutoCloseable {
 
   private RequestHandler handler(final Meter meter) {
     final Consumer<Context> counter = meter != null ? counter(meter) : null;
-    final Deque<JsonObject> publisher = publisher();
+    final Queue<JsonObject> publisher = publisher();
 
     return (request, requestBody, response) ->
         Optional.of(request.method())
@@ -215,11 +236,6 @@ public class Publisher implements AutoCloseable {
                         response, !request.method().equals(POST) ? NOT_IMPLEMENTED : FORBIDDEN));
   }
 
-  private <T> Optional<T> configValue(final BiFunction<Config, String, T> fn, final String path) {
-    return ofNullable(config)
-        .flatMap(c -> net.pincette.config.Util.configValue(p -> fn.apply(c, p), path));
-  }
-
   private <T> ProducerRecord<String, T> publishMessage(
       final JsonObject json, final Function<JsonObject, T> mapper) {
     return tracesTopic != null && json.containsKey(TRACE_ID_FIELD)
@@ -227,25 +243,25 @@ public class Publisher implements AutoCloseable {
         : new ProducerRecord<>(topic, json.getString(ID), mapper.apply(json));
   }
 
-  private Deque<JsonObject> publisher() {
+  private Queue<JsonObject> publisher() {
     return asString
         ? publisher(v -> string(v, false), () -> producerString(kafkaConfig))
         : publisher(v -> v, () -> producer(kafkaConfig));
   }
 
-  private <T> Deque<JsonObject> publisher(
+  private <T> Queue<JsonObject> publisher(
       final Function<JsonObject, T> mapper, final Supplier<KafkaProducer<String, T>> producer) {
-    final DequePublisher<JsonObject> dequePublisher = new DequePublisher<>();
+    final QueuePublisher<JsonObject> queuePublisher = queuePublisher();
 
-    with(dequePublisher).map(v -> publishMessage(v, mapper)).get().subscribe(subscriber(producer));
+    with(queuePublisher).map(v -> publishMessage(v, mapper)).get().subscribe(subscriber(producer));
 
-    return dequePublisher.getDeque();
+    return queuePublisher.getQueue();
   }
 
   private CompletionStage<Throwable> readMessage(
       final HttpRequest request,
       final Flow.Publisher<ByteBuf> requestBody,
-      final Deque<JsonObject> publisher,
+      final Queue<JsonObject> publisher,
       final Consumer<Context> counter) {
     final CompletableFuture<Throwable> future = new CompletableFuture<>();
 
@@ -267,13 +283,13 @@ public class Publisher implements AutoCloseable {
                 }))
         .map(
             json ->
-                eventTrace != null
-                    ? list(json, traceMessage(new Context(request, json)))
-                    : list(json))
+                ofNullable(eventTrace)
+                    .flatMap(e -> traceMessage(new Context(request, json)))
+                    .map(m -> list(json, m))
+                    .orElseGet(() -> list(json)))
         .map(flattenList())
         .get()
-        .subscribe(
-            lambdaSubscriber(publisher::addFirst, () -> future.complete(null), future::complete));
+        .subscribe(lambdaSubscriber(publisher::add, () -> future.complete(null), future::complete));
 
     return future;
   }
@@ -287,14 +303,19 @@ public class Publisher implements AutoCloseable {
         LOGGER);
   }
 
-  private JsonObject traceMessage(final Context context) {
-    return eventTrace
-        .withTraceId(context.message.getString(CORR))
-        .withTimestamp(now())
-        .withAttributes(put(telemetryAttributes.apply(context), INSTANCE_ATTRIBUTE, instance))
-        .withUsername(getUsername(context.message).orElse(ANONYMOUS))
-        .toJson()
-        .build();
+  private Optional<JsonObject> traceMessage(final Context context) {
+    return getString(context.message, "/" + CORR)
+        .filter(corr -> retainTraceSample(corr, tracePercentage))
+        .map(
+            corr ->
+                eventTrace
+                    .withTraceId(corr)
+                    .withTimestamp(now())
+                    .withAttributes(
+                        put(telemetryAttributes.apply(context), INSTANCE_ATTRIBUTE, instance))
+                    .withUsername(getUsername(context.message).orElse(ANONYMOUS))
+                    .toJson()
+                    .build());
   }
 
   public Publisher withConfig(final Config config) {
