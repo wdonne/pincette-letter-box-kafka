@@ -6,7 +6,7 @@
 
   <groupId>net.pincette</groupId>
   <artifactId>pincette-letter-box-kafka</artifactId>
-  <version>1.1.1</version>
+  <version>1.1.2</version>
   <packaging>jar</packaging>
   <name>pincette-letter-box-kafka</name>
   <description>The Kafka publisher for the letter box pattern</description>
@@ -62,7 +62,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-netty-http</artifactId>
-      <version>3.2.14</version>
+      <version>3.2.15</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -72,7 +72,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs</artifactId>
-      <version>3.11.3</version>
+      <version>3.11.4</version>
     </dependency>
     <dependency>
       <groupId>org.apache.kafka</groupId>
@@ -82,12 +82,12 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs-json</artifactId>
-      <version>1.0.24</version>
+      <version>1.0.25</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs-kafka</artifactId>
-      <version>1.4.3</version>
+      <version>1.4.4</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -97,12 +97,12 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes</artifactId>
-      <version>4.0.0</version>
+      <version>4.0.1</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes-util</artifactId>
-      <version>3.3.1</version>
+      <version>3.3.2</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
